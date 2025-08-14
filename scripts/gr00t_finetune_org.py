@@ -125,11 +125,6 @@ class ArgsConfig:
     balance_trajectory_weights: bool = True
     """Used in LeRobotMixtureDataset. If True, sample trajectories within a dataset weighted by their length; otherwise, equal weighting."""
 
-    delte_pause_frame: bool = False
-    """Whether to delete pause frames in the dataset."""
-
-    augsteps: int = 0
-    """Number of augmentation steps to use."""
 
 #####################################################################################
 # main training function
@@ -154,10 +149,7 @@ def main(config: ArgsConfig):
             transforms=transforms,
             embodiment_tag=embodiment_tag,  # This will override the dataset's embodiment tag to "new_embodiment"
             video_backend=config.video_backend,
-            delte_pause_frame=config.delte_pause_frame,
-            augsteps=config.augsteps,
         )
-        train_dataset.save_dataset_statistics(save_path=Path(config.output_dir) / "dataset_statistics.json")
     else:
         single_datasets = []
         for p in config.dataset_path:
@@ -170,8 +162,6 @@ def main(config: ArgsConfig):
                 transforms=transforms,
                 embodiment_tag=embodiment_tag,
                 video_backend=config.video_backend,
-                delte_pause_frame=config.delte_pause_frame,
-                augsteps=config.augsteps,
             )
             single_datasets.append(dataset)
 

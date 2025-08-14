@@ -12,13 +12,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# import debugpy 
+
+# debugpy.listen(("0.0.0.0", 10093))  # 监听端口 
+# print("Waiting for debugger to attach...")
+# debugpy.wait_for_client()  # 等待 VS Code 附加
+
+# a = 1
+
 
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Literal
+import json
 
 import torch
 import tyro
@@ -31,6 +40,8 @@ from gr00t.experiment.runner import TrainRunner
 from gr00t.model.gr00t_n1 import GR00T_N1_5
 from gr00t.model.transforms import EMBODIMENT_TAG_MAPPING
 from gr00t.utils.peft import get_lora_model
+from torch.serialization import add_safe_globals
+
 
 
 @dataclass
@@ -64,7 +75,7 @@ class ArgsConfig:
     """Number of steps between saving checkpoints."""
 
     # Model parameters
-    base_model_path: str = "/mnt/petrelfs/share/efm_p/wangfangjing/nvidia/GR00T-N1.5-3B"
+    base_model_path: str = "/mnt/petrelfs/share/efm_p/wangfangjing/nvidia/GR00T-N1.5-3B-new"
     """Path or HuggingFace model ID for the base model."""
 
     tune_llm: bool = False
@@ -125,6 +136,22 @@ class ArgsConfig:
     balance_trajectory_weights: bool = True
     """Used in LeRobotMixtureDataset. If True, sample trajectories within a dataset weighted by their length; otherwise, equal weighting."""
 
+    # JINYU: these are added for multi-node training according to gpt
+    num_nodes: int = int(os.getenv("SLURM_NNODES", 1))
+    """Total number of nodes involved in training."""
+
+    node_rank: int = int(os.getenv("SLURM_NODEID", 0))
+    """Rank of this node (0–num_nodes-1)."""
+
+    master_addr: str = os.getenv("MASTER_ADDR", "127.0.0.1")
+    """Rendezvous master IP / hostname."""
+
+    master_port: int = int(os.getenv("MASTER_PORT", 29500))
+    """Rendezvous master port."""
+    
+    deepspeed_config: str = ""
+    """Deepspeed config file."""
+
     delte_pause_frame: bool = False
     """Whether to delete pause frames in the dataset."""
 
@@ -138,10 +165,19 @@ class ArgsConfig:
 
 def main(config: ArgsConfig):
     """Main training function."""
+    # 保存 config 到 output_dir
+    os.makedirs(config.output_dir, exist_ok=True)
+    config_path = os.path.join(config.output_dir, "config.json")
+    with open(config_path, "w") as f:
+        json.dump(asdict(config), f, indent=2)
+    print(f"Config saved to {config_path}")
+
     # ------------ step 1: load dataset ------------
     embodiment_tag = EmbodimentTag(config.embodiment_tag)
 
     # 1.1 modality configs and transforms
+    print(f"Loading dataset with data_config: {config.data_config}")
+    print(f"DATA_CONFIG_MAP: {DATA_CONFIG_MAP.keys()}")
     data_config_cls = DATA_CONFIG_MAP[config.data_config]
     modality_configs = data_config_cls.modality_config()
     transforms = data_config_cls.transform()
@@ -256,7 +292,7 @@ def main(config: ArgsConfig):
         output_dir=config.output_dir,
         run_name=config.run_name,
         remove_unused_columns=False,
-        deepspeed="",
+        deepspeed=config.deepspeed_config,
         gradient_checkpointing=False,
         bf16=True,
         tf32=True,
@@ -283,8 +319,8 @@ def main(config: ArgsConfig):
         report_to=config.report_to,
         seed=42,
         do_eval=False,
-        ddp_find_unused_parameters=False,
-        ddp_bucket_cap_mb=100,
+        # ddp_find_unused_parameters=False,
+        # ddp_bucket_cap_mb=100,
         torch_compile_mode=None,
     )
 
@@ -299,76 +335,65 @@ def main(config: ArgsConfig):
     # 2.3 run experiment
     experiment.train()
 
+import os, sys, subprocess, time
+from pathlib import Path
+import torch
+import tyro
+from dataclasses import asdict
+
+def already_distributed() -> bool:
+    """判断当前进程是否已由 torchrun / torch.distributed.elastic 启动"""
+    print(f"WORLD_SIZE: {os.getenv('WORLD_SIZE', '1')}")
+    print(f"LOCAL_RANK: {os.getenv('LOCAL_RANK', '1')}")
+    print(f"RANK: {os.getenv('RANK', '1')}")
+    print(f"TORCHELASTIC_RUN_ID: {os.getenv('TORCHELASTIC_RUN_ID', 'None')}")
+    return int(os.getenv("WORLD_SIZE", "1")) > 1 or os.getenv("TORCHELASTIC_RUN_ID") is not None
+
+def launch_single_node_torchrun(config):
+    script_path = Path(__file__).absolute()
+    cmd = [
+        "torchrun",
+        f"--nnodes=1",
+        f"--nproc-per-node={config.num_gpus}",
+        "--rdzv_backend=c10d",
+        f"--rdzv_endpoint=127.0.0.1:{config.master_port}",
+        "--rdzv_id", f"local-{int(time.time())}",
+        str(script_path),
+    ]
+    print(f"cmd: {cmd}")
+    # 将 ArgsConfig 重新展开为 CLI
+    for k, v in asdict(config).items():
+        cli_key = f"--{k.replace('_', '-')}"
+        if isinstance(v, bool):
+            cmd.append(cli_key) if v else cmd.append(f"--no-{cli_key.lstrip('--')}")
+        elif isinstance(v, list):
+            cmd.append(cli_key)
+            cmd += map(str, v)
+        else:
+            cmd += [cli_key, str(v)]
+    print("Launching (single-node) torchrun:", " ".join(cmd))
+    os.execvp(cmd[0], cmd)      # 用 exec 替换当前进程，避免多余子进程
+
 
 if __name__ == "__main__":
-    import debugpy
-    # debugpy.listen(("0.0.0.0", 10092))
-    # print("Waiting for client to attach...")
-    # debugpy.wait_for_client()
-
-    # Parse arguments using tyro
+    # 1️⃣ 解析 CLI
     config = tyro.cli(ArgsConfig)
 
-    # Print the tyro config
-    print("\n" + "=" * 50)
-    print("GR00T FINE-TUNING CONFIGURATION:")
-    print("=" * 50)
-    for key, value in vars(config).items():
-        print(f"{key}: {value}")
-    print("=" * 50 + "\n")
+    # 2️⃣ 设备/参数检查
+    config.num_gpus = int(config.num_gpus)           # 防止字符串
+    available = torch.cuda.device_count()
+    assert 0 < config.num_gpus <= available, f"num_gpus={config.num_gpus}, but only {available} visible"
 
-    available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
-
-    # Validate GPU configuration
-    assert (
-        config.num_gpus <= available_gpus
-    ), f"Number of GPUs requested ({config.num_gpus}) is greater than the available GPUs ({available_gpus})"
-    assert config.num_gpus > 0, "Number of GPUs must be greater than 0"
-    print(f"Using {config.num_gpus} GPUs")
-
-    if config.num_gpus == 1:
-        # Single GPU mode - set CUDA_VISIBLE_DEVICES=0
-        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-        # Run the script normally
+    # 3️⃣ 决定启动路径
+    if already_distributed():
+        # 已由 torchrun/srun 启动 → 直接进入主程序
+        print("[INFO] Detected distributed environment.")
         main(config)
+
+    elif config.num_gpus == 1:
+        print("[INFO] Single-GPU mode (no torchrun).")
+        main(config)
+
     else:
-        if os.environ.get("IS_TORCHRUN", "0") == "1":
-            main(config)
-        else:
-            # Multi-GPU mode - use torchrun
-            script_path = Path(__file__).absolute()
-            # Remove any existing CUDA_VISIBLE_DEVICES from environment
-            if "CUDA_VISIBLE_DEVICES" in os.environ:
-                del os.environ["CUDA_VISIBLE_DEVICES"]
-
-            # Use subprocess.run instead of os.system
-            cmd = [
-                "torchrun",
-                "--standalone",
-                f"--nproc_per_node={config.num_gpus}",
-                "--nnodes=1",  # default to 1 node for now
-                str(script_path),
-            ]
-
-            # Convert config to command line arguments
-            for key, value in vars(config).items():
-                if isinstance(value, bool):
-                    # For boolean values, use --flag or --no-flag format
-                    if value:
-                        cmd.append(f"--{key.replace('_', '-')}")
-                    else:
-                        cmd.append(f"--no-{key.replace('_', '-')}")
-                else:
-                    # For non-boolean values, use --key value format
-                    cmd.append(f"--{key.replace('_', '-')}")
-
-                    # if the value is a list (e.g. dataset_path), we need to add each element in the list
-                    if isinstance(value, list):
-                        for v in value:
-                            cmd.append(str(v))
-                    else:
-                        cmd.append(str(value))
-            print("Running torchrun command: ", cmd)
-            env = os.environ.copy()
-            env["IS_TORCHRUN"] = "1"
-            sys.exit(subprocess.run(cmd, env=env).returncode)
+        # 单机多卡 → 本脚本生成 torchrun（1 节点）
+        launch_single_node_torchrun(config)
